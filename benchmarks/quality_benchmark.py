@@ -307,11 +307,6 @@ def run(quick=False):
     ppl_baseline = perplexity(model, tokenizer, text, n_tokens)
     print(f"→ ppl={ppl_baseline:.2f}  ({time.perf_counter()-t0:.0f}s)\n")
 
-    print("calibrating learned rotations …")
-    t0 = time.perf_counter()
-    learned_rots = calibrate_rotations(model, tokenizer, text)
-    print(f"done  ({time.perf_counter()-t0:.0f}s)\n")
-
     del model
 
     variants = [
@@ -320,12 +315,6 @@ def run(quick=False):
 
         ("TurboQuant m=2d sketch",
          lambda d, kb, vb, li, hi: _FastKVCache(d, kb, vb, li, hi, sketch_mult=2)),
-
-        ("TurboQuant learned rot",
-         lambda d, kb, vb, li, hi: _FastKVCache(d, kb, vb, li, hi,
-                                                  rotation=learned_rots.get((li, hi)))),
-        ("Polar + QJL",
-         lambda d, kb, vb, li, hi: _PolarQJLCache(d, kb, vb, li, hi)),
     ]
 
     all_runs = [(label, factory, kb, vb) for label, factory in variants for kb, vb in configs]
