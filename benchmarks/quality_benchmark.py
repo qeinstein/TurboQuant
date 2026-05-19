@@ -17,8 +17,6 @@ MAX_LEN = 1024
 DEVICE = torch.device("cpu")
 
 
-# ── polar transform helpers ──────────────────────────────────────────────────
-
 def _to_polar(X):
     """X: (N, d) → (angles_list, radii). d must be a power of 2.
     Level 0 angles ∈ (-π, π]; level k≥1 angles ∈ [0, π/2].
@@ -61,7 +59,6 @@ def _quantize_angles(angles_list):
     return out
 
 
-# ── KV cache implementations ─────────────────────────────────────────────────
 
 class _FastKVCache:
     """Vectorized TurboQuant. sketch_mult controls QJL sketch size (m = d * sketch_mult).
@@ -183,7 +180,6 @@ class _PolarQJLCache:
         self._v_ang = self._v_rad = self._vn = None
 
 
-# ── learned rotation calibration ─────────────────────────────────────────────
 
 @torch.no_grad()
 def calibrate_rotations(model, tokenizer, text, n_calib=512):
@@ -221,7 +217,6 @@ def calibrate_rotations(model, tokenizer, text, n_calib=512):
     return rotations
 
 
-# ── attention patch ───────────────────────────────────────────────────────────
 
 def make_tq_attention(orig_attn, key_bits, val_bits, layer_idx, cache_factory):
     n_heads = orig_attn.num_heads
@@ -258,7 +253,6 @@ def make_tq_attention(orig_attn, key_bits, val_bits, layer_idx, cache_factory):
     return orig_attn
 
 
-# ── perplexity ────────────────────────────────────────────────────────────────
 
 @torch.no_grad()
 def perplexity(model, tokenizer, text, n_tokens=N_TOKENS, label=""):
@@ -295,7 +289,6 @@ def perplexity(model, tokenizer, text, n_tokens=N_TOKENS, label=""):
     return math.exp(sum(nlls) / n_tokens)
 
 
-# ── main ──────────────────────────────────────────────────────────────────────
 
 def run(quick=False):
     n_tokens = STRIDE if quick else N_TOKENS
