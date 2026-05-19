@@ -268,6 +268,7 @@ def perplexity(model, tokenizer, text, n_tokens=N_TOKENS, label=""):
         chunk = input_ids[:, begin:end]
         target_len = end - i
 
+        chunk_t0 = time.perf_counter()
         out = model(chunk, labels=chunk)
         shift_logits = out.logits[:, -target_len:-1]
         shift_labels = chunk[:, -target_len + 1:]
@@ -278,16 +279,15 @@ def perplexity(model, tokenizer, text, n_tokens=N_TOKENS, label=""):
         nlls.append(loss.item() * target_len)
 
         elapsed = time.perf_counter() - t0
+        chunk_time = time.perf_counter() - chunk_t0
         avg = elapsed / (idx + 1)
         eta = avg * (len(chunks) - idx - 1)
-        prefix = f"  [{label}] " if label else "  "
-        print(f"{prefix}chunk {idx+1}/{len(chunks)}  "
-              f"ppl so far {math.exp(sum(nlls) / ((idx+1) * STRIDE)):.2f}  "
-              f"elapsed {elapsed:.0f}s  eta {eta:.0f}s", end="\r", flush=True)
+        running_ppl = math.exp(sum(nlls) / ((idx + 1) * STRIDE))
+        print(f"  chunk {idx+1}/{len(chunks)}  "
+              f"loss={loss.item():.3f}  ppl={running_ppl:.2f}  "
+              f"chunk_time={chunk_time:.0f}s  elapsed={elapsed:.0f}s  eta={eta:.0f}s")
 
-    print()
     return math.exp(sum(nlls) / n_tokens)
-
 
 
 def run(quick=False):
@@ -302,15 +302,15 @@ def run(quick=False):
     model = AutoModelForCausalLM.from_pretrained(MODEL_NAME).to(DEVICE)
     model.eval()
 
-    print("running baseline …")
+    print("\n=== baseline (fp16) ===")
     t0 = time.perf_counter()
-    ppl_baseline = perplexity(model, tokenizer, text, n_tokens, label="baseline")
-    print(f"fp16 baseline  ppl={ppl_baseline:.2f}  ({time.perf_counter()-t0:.0f}s)\n")
+    ppl_baseline = perplexity(model, tokenizer, text, n_tokens)
+    print(f"→ ppl={ppl_baseline:.2f}  ({time.perf_counter()-t0:.0f}s)\n")
 
     print("calibrating learned rotations …")
     t0 = time.perf_counter()
     learned_rots = calibrate_rotations(model, tokenizer, text)
-    print(f"calibration done  ({time.perf_counter()-t0:.0f}s)\n")
+    print(f"done  ({time.perf_counter()-t0:.0f}s)\n")
 
     del model
 
@@ -328,20 +328,60 @@ def run(quick=False):
          lambda d, kb, vb, li, hi: _PolarQJLCache(d, kb, vb, li, hi)),
     ]
 
-    for label, factory in variants:
-        for key_bits, val_bits in configs:
-            model_tq = AutoModelForCausalLM.from_pretrained(MODEL_NAME).to(DEVICE)
-            model_tq.eval()
-            for i, block in enumerate(model_tq.transformer.h):
-                make_tq_attention(block.attn, key_bits=key_bits, val_bits=val_bits,
-                                  layer_idx=i, cache_factory=factory)
-            run_label = f"{label} key={key_bits}b val={val_bits}b"
-            print(f"running {run_label} …")
-            t0 = time.perf_counter()
-            ppl = perplexity(model_tq, tokenizer, text, n_tokens, label=run_label)
-            delta = ppl - ppl_baseline
-            print(f"{run_label}  ppl={ppl:.2f}  Δ={delta:+.2f}  ({time.perf_counter()-t0:.0f}s)\n")
-            del model_tq
+    all_runs = [(label, factory, kb, vb) for label, factory in variants for kb, vb in configs]
+    total_runs = len(all_runs)
+    results = []
+    run_times = []
+    global_t0 = time.perf_counter()
+
+    for run_idx, (label, factory, key_bits, val_bits) in enumerate(all_runs):
+        done = run_idx
+        remaining = total_runs - done
+        if run_times:
+            avg_run = sum(run_times) / len(run_times)
+            overall_eta = avg_run * remaining
+            eta_str = f"  overall ETA {overall_eta/60:.1f} min"
+        else:
+            eta_str = ""
+
+        run_label = f"{label}  key={key_bits}b val={val_bits}b"
+        print(f"=== [{run_idx+1}/{total_runs}] {run_label}{eta_str} ===")
+
+        model_tq = AutoModelForCausalLM.from_pretrained(MODEL_NAME).to(DEVICE)
+        model_tq.eval()
+        for i, block in enumerate(model_tq.transformer.h):
+            make_tq_attention(block.attn, key_bits=key_bits, val_bits=val_bits,
+                              layer_idx=i, cache_factory=factory)
+        t0 = time.perf_counter()
+        ppl = perplexity(model_tq, tokenizer, text, n_tokens)
+        elapsed = time.perf_counter() - t0
+        run_times.append(elapsed)
+        del model_tq
+
+        delta = ppl - ppl_baseline
+        base_result = next((r for r in results if r[0].startswith("TurboQuant base") and f"key={key_bits}b val={val_bits}b" in r[0]), None)
+        beats = ""
+        if base_result and label != "TurboQuant base":
+            beats = "  *** BEATS BASE ***" if ppl < base_result[1] else f"  (base was {base_result[1]:.2f})"
+        results.append((run_label, ppl, delta))
+
+        total_elapsed = time.perf_counter() - global_t0
+        runs_left = total_runs - (run_idx + 1)
+        avg_run = sum(run_times) / len(run_times)
+        remaining_str = f"{runs_left} run(s) left  ~{avg_run * runs_left / 60:.1f} min remaining" if runs_left else "all done"
+        print(f"→ ppl={ppl:.2f}  Δ={delta:+.2f} vs fp16  ({elapsed:.0f}s){beats}")
+        print(f"  {remaining_str}  total elapsed {total_elapsed/60:.1f} min\n")
+
+    print("=" * 62)
+    print(f"{'variant':<42} {'ppl':>6}  {'Δ fp16':>8}")
+    print("-" * 62)
+    print(f"{'fp16 baseline':<42} {ppl_baseline:>6.2f}  {'—':>8}")
+    for label, ppl, delta in results:
+        bits_tag = "key=" + label.split("key=")[1] if "key=" in label else ""
+        base = next((r for r in results if r[0].startswith("TurboQuant base") and bits_tag in r[0]), None)
+        marker = " *** BEATS BASE" if base and label != base[0] and ppl < base[1] else ""
+        print(f"{label:<42} {ppl:>6.2f}  {delta:>+8.2f}{marker}")
+    print("=" * 62)
 
 
 if __name__ == "__main__":
