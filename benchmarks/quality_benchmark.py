@@ -1,73 +1,109 @@
-"""Perplexity benchmark on WikiText-2 using GPT-2.
-
-Compares fp16 baseline against TurboQuant KV cache compression at
-various bit-widths. Uses a monkey-patched attention forward pass so
-the benchmark is model-agnostic.
-
-Run with:
-    python benchmarks/quality_benchmark.py
-
-Requirements: pip install transformers datasets accelerate
-"""
-
 import math
+import sys
 import torch
 from torch import nn
 from transformers import AutoTokenizer, AutoModelForCausalLM
 from datasets import load_dataset
 
-from turboquant.kv_cache import TurboQuantKVCache
+from turboquant.core.rotation import make_rotation, rotation_seed
+from turboquant.core.codebook import get_codebook
+from turboquant.qjl.transform import make_projection
 
 MODEL_NAME = "gpt2"
-N_TOKENS = 2048     # tokens to evaluate perplexity on
-STRIDE = 512        # sliding window stride
-MAX_LEN = 1024      # model context window
+N_TOKENS = 2048
+STRIDE = 512
+MAX_LEN = 1024
 DEVICE = torch.device("cpu")
 
 
-def make_tq_attention(orig_attn, key_bits: int, val_bits: int, layer_idx: int):
-    """Wrap a GPT-2 attention module to use TurboQuant compressed KV cache."""
+class _FastKVCache:
+    """Vectorized KV cache — stores dequantized coords, no pack/unpack."""
+
+    def __init__(self, d, key_bits, val_bits, layer_idx, head_idx):
+        seed = rotation_seed(layer_idx, head_idx)
+        self.Pi = make_rotation(d, seed)                   # (d, d)
+        self.S = make_projection(d, d, seed + 1)           # (d, d)
+        self.key_cb = get_codebook(d, key_bits - 1)        # TurboQuantProd uses bits-1 for MSE
+        self.val_cb = get_codebook(d, val_bits)
+        self.d = d
+        self._K = self._kn = self._rt = self._rn = None
+        self._V = self._vn = None
+
+    def batch_encode(self, keys, values):
+        """Encode all tokens at once. keys, values: (N, d)."""
+        keys, values = keys.float(), values.float()
+
+        # Keys — TurboQuantProd
+        k_norms = torch.linalg.norm(keys, dim=1, keepdim=True)          # (N, 1)
+        k_units = keys / k_norms.clamp(min=1e-12)
+        k_rot = k_units @ self.Pi.T                                       # (N, d)
+        k_y_hat = self.key_cb[(k_rot.unsqueeze(-1) - self.key_cb).pow(2).argmin(-1)]
+
+        k_hat = k_norms * (k_y_hat @ self.Pi)                            # (N, d)
+        r = keys - k_hat
+
+        self._K = k_y_hat                                                 # (N, d)
+        self._kn = k_norms.squeeze(1)                                     # (N,)
+        self._rt = (r @ self.S.T).sign()                                  # (N, d)
+        self._rn = torch.linalg.norm(r, dim=1)                           # (N,)
+
+        # Values — TurboQuantMSE
+        v_norms = torch.linalg.norm(values, dim=1, keepdim=True)
+        v_units = values / v_norms.clamp(min=1e-12)
+        v_rot = v_units @ self.Pi.T
+        v_y_hat = self.val_cb[(v_rot.unsqueeze(-1) - self.val_cb).pow(2).argmin(-1)]
+
+        self._V = v_y_hat
+        self._vn = v_norms.squeeze(1)
+
+    def all_scores(self, Q):
+        """Q: (seq_len, d) → (seq_len, N) inner products with all cached keys."""
+        PQ = Q @ self.Pi.T                                                # (seq_len, d)
+        ip_mse = (PQ @ self._K.T) * self._kn.unsqueeze(0)                # (seq_len, N)
+
+        SQ = Q @ self.S.T                                                 # (seq_len, d)
+        ip_qjl = (math.sqrt(math.pi / 2) / self.d) * (SQ @ self._rt.T) * self._rn.unsqueeze(0)
+
+        return ip_mse + ip_qjl
+
+    def values(self):
+        return self._vn.unsqueeze(1) * (self._V @ self.Pi)               # (N, d)
+
+    def clear(self):
+        self._K = self._kn = self._rt = self._rn = None
+        self._V = self._vn = None
+
+
+def make_tq_attention(orig_attn, key_bits, val_bits, layer_idx):
     n_heads = orig_attn.num_heads
     head_dim = orig_attn.head_dim
 
-    caches = [
-        TurboQuantKVCache(d=head_dim, key_bits=key_bits, val_bits=val_bits,
-                          layer_idx=layer_idx, head_idx=h)
-        for h in range(n_heads)
-    ]
+    caches = [_FastKVCache(head_dim, key_bits, val_bits, layer_idx, h) for h in range(n_heads)]
 
     def tq_forward(hidden_states, **kwargs):
         for c in caches:
             c.clear()
 
         bsz, seq_len, _ = hidden_states.shape
-        # Split projection: (b, s, 3*embed) → three (b, s, embed) tensors
-        q_proj, k_proj, v_proj = orig_attn.c_attn(hidden_states).split(
-            orig_attn.split_size, dim=2
-        )
-        # Reshape to (b, n_heads, s, head_dim)
+        q_proj, k_proj, v_proj = orig_attn.c_attn(hidden_states).split(orig_attn.split_size, dim=2)
         shape = (bsz, seq_len, n_heads, head_dim)
-        query = q_proj.view(shape).transpose(1, 2)
-        key   = k_proj.view(shape).transpose(1, 2)
-        value = v_proj.view(shape).transpose(1, 2)
+        Q = q_proj.view(shape).transpose(1, 2)    # (b, h, s, d)
+        K = k_proj.view(shape).transpose(1, 2)
+        V = v_proj.view(shape).transpose(1, 2)
 
-        attn_output_heads = []
+        mask = torch.triu(torch.full((seq_len, seq_len), float('-inf')), diagonal=1)
+
+        head_outs = []
         for h in range(n_heads):
-            for t in range(seq_len):
-                caches[h].append(key[0, h, t], value[0, h, t])
+            caches[h].batch_encode(K[0, h], V[0, h])
+            scores = caches[h].all_scores(Q[0, h]) + mask                # (s, s)
+            weights = torch.softmax(scores / math.sqrt(head_dim), dim=1)
+            head_outs.append(weights @ caches[h].values())               # (s, d)
 
-            head_outputs = []
-            for t in range(seq_len):
-                q_t = query[0, h, t]
-                raw = caches[h].attn_scores(q_t)[:t+1]
-                w = torch.softmax(raw / math.sqrt(head_dim), dim=0)
-                vals = caches[h].values()[:t+1]
-                head_outputs.append((w.unsqueeze(1) * vals).sum(0))
-
-            attn_output_heads.append(torch.stack(head_outputs))  # (s, head_dim)
-
-        # (n_heads, s, head_dim) → (b, s, embed_dim)
-        out = torch.stack(attn_output_heads, dim=0).transpose(0, 1).reshape(bsz, seq_len, n_heads * head_dim)
+        out = (torch.stack(head_outs)          # (h, s, d)
+                    .unsqueeze(0)              # (1, h, s, d)
+                    .transpose(1, 2)           # (1, s, h, d)
+                    .reshape(bsz, seq_len, n_heads * head_dim))
         out = orig_attn.c_proj(out)
         out = orig_attn.resid_dropout(out)
         return out, None
@@ -77,56 +113,53 @@ def make_tq_attention(orig_attn, key_bits: int, val_bits: int, layer_idx: int):
 
 
 @torch.no_grad()
-def perplexity(model, tokenizer, text: str) -> float:
+def perplexity(model, tokenizer, text, n_tokens=N_TOKENS):
     encodings = tokenizer(text, return_tensors="pt")
     input_ids = encodings.input_ids.to(DEVICE)
 
     nlls = []
-    for i in range(0, min(N_TOKENS, input_ids.size(1) - 1), STRIDE):
+    for i in range(0, min(n_tokens, input_ids.size(1) - 1), STRIDE):
         begin = max(0, i - MAX_LEN + STRIDE)
         end = min(i + STRIDE, input_ids.size(1))
         chunk = input_ids[:, begin:end]
         target_len = end - i
 
-        with torch.no_grad():
-            out = model(chunk, labels=chunk)
-            # Only count loss on the target tokens (not the context prefix).
-            shift_logits = out.logits[:, -target_len:-1]
-            shift_labels = chunk[:, -target_len+1:]
-            loss = nn.CrossEntropyLoss()(
-                shift_logits.reshape(-1, shift_logits.size(-1)),
-                shift_labels.reshape(-1)
-            )
+        out = model(chunk, labels=chunk)
+        shift_logits = out.logits[:, -target_len:-1]
+        shift_labels = chunk[:, -target_len + 1:]
+        loss = nn.CrossEntropyLoss()(
+            shift_logits.reshape(-1, shift_logits.size(-1)),
+            shift_labels.reshape(-1),
+        )
         nlls.append(loss.item() * target_len)
 
-    return math.exp(sum(nlls) / N_TOKENS)
+    return math.exp(sum(nlls) / n_tokens)
 
 
-def run():
+def run(quick=False):
+    n_tokens = STRIDE if quick else N_TOKENS        # one chunk in quick mode
+    configs = [(4, 2)] if quick else [(4, 2), (3, 2), (2, 2)]
+
     print(f"Loading {MODEL_NAME} and WikiText-2 …")
     tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
     dataset = load_dataset("wikitext", "wikitext-2-raw-v1", split="test")
     text = "\n\n".join(dataset["text"])
 
-    # Baseline
     model = AutoModelForCausalLM.from_pretrained(MODEL_NAME).to(DEVICE)
     model.eval()
-    ppl_baseline = perplexity(model, tokenizer, text)
+    ppl_baseline = perplexity(model, tokenizer, text, n_tokens)
     print(f"fp16 baseline perplexity: {ppl_baseline:.2f}")
 
-    # TurboQuant at various bit-widths
-    for key_bits, val_bits in [(4, 2), (3, 2), (2, 2)]:
+    for key_bits, val_bits in configs:
         model_tq = AutoModelForCausalLM.from_pretrained(MODEL_NAME).to(DEVICE)
         model_tq.eval()
         for i, block in enumerate(model_tq.transformer.h):
-            make_tq_attention(block.attn, key_bits=key_bits,
-                              val_bits=val_bits, layer_idx=i)
-        ppl = perplexity(model_tq, tokenizer, text)
+            make_tq_attention(block.attn, key_bits=key_bits, val_bits=val_bits, layer_idx=i)
+        ppl = perplexity(model_tq, tokenizer, text, n_tokens)
         delta = ppl - ppl_baseline
-        print(f"TurboQuant key={key_bits}b val={val_bits}b  ppl={ppl:.2f}  "
-              f"Δ={delta:+.2f}")
+        print(f"TurboQuant key={key_bits}b val={val_bits}b  ppl={ppl:.2f}  Δ={delta:+.2f}")
         del model_tq
 
 
 if __name__ == "__main__":
-    run()
+    run(quick="--quick" in sys.argv)
