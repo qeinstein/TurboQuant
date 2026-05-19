@@ -25,8 +25,6 @@ MAX_LEN = 1024      # model context window
 DEVICE = torch.device("cpu")
 
 
-# ── Monkey-patch helpers ──────────────────────────────────────────────────────
-
 def make_tq_attention(orig_attn, key_bits: int, val_bits: int, layer_idx: int):
     """Wrap a GPT-2 attention module to use TurboQuant compressed KV cache."""
     n_heads = orig_attn.num_heads
@@ -85,8 +83,6 @@ def make_tq_attention(orig_attn, key_bits: int, val_bits: int, layer_idx: int):
     return orig_attn
 
 
-# ── Perplexity computation ────────────────────────────────────────────────────
-
 @torch.no_grad()
 def perplexity(model, tokenizer, text: str) -> float:
     encodings = tokenizer(text, return_tensors="pt")
@@ -112,8 +108,6 @@ def perplexity(model, tokenizer, text: str) -> float:
 
     return math.exp(sum(nlls) / N_TOKENS)
 
-
-# ── Main ──────────────────────────────────────────────────────────────────────
 
 def run():
     print(f"Loading {MODEL_NAME} and WikiText-2 …")

@@ -5,7 +5,6 @@ from turboquant import TurboQuantMSE, TurboQuantProd, TurboQuantKVCache
 
 D = 128  # head dimension
 
-# ── MSE quantizer ────────────────────────────────────────────────────────────
 print("=== TurboQuantMSE (value compression) ===")
 mse_q = TurboQuantMSE(d=D, bits=4, layer_idx=0, head_idx=0)
 
@@ -20,7 +19,6 @@ print(f"  Compressed: {compressed_bytes} bytes")
 print(f"  Ratio:      {fp16_bytes / compressed_bytes:.1f}x")
 print(f"  MSE:        {((v - v_hat)**2).mean().item():.5f}")
 
-# ── Inner product quantizer ───────────────────────────────────────────────────
 print("\n=== TurboQuantProd (key compression) ===")
 prod_q = TurboQuantProd(d=D, bits=4, layer_idx=0, head_idx=1)
 
@@ -38,7 +36,6 @@ print(f"  Ratio:      {fp16_bytes / compressed_bytes:.1f}x")
 print(f"  True <q,k>:  {true_ip:.4f}")
 print(f"  Est  <q,k>:  {est_ip:.4f}")
 
-# ── KV cache ─────────────────────────────────────────────────────────────────
 print("\n=== TurboQuantKVCache (attention layer) ===")
 cache = TurboQuantKVCache(d=D, key_bits=4, val_bits=2, layer_idx=0, head_idx=0)
 
