@@ -86,28 +86,18 @@ Output cosine similarity vs fp16 at 4-bit keys: **~0.92** on a single attention 
 
 Full perplexity numbers: run `quality_benchmark.py`.
 
-## Experiments
-
-The quality benchmark includes three variants on top of the base TurboQuant algorithm. All numbers below are perplexity on WikiText-2 (GPT-2, 512 tokens, 4-bit keys + 2-bit values, fp16 baseline = 31.00).
+## Perplexity results (WikiText-2, GPT-2, 2048 tokens)
 
 | Variant | PPL | Δ vs fp16 |
 |---|---|---|
-| fp16 baseline | 31.00 | — |
-| TurboQuant base | 44.78 | +13.78 |
-| **TurboQuant m=2d sketch** | **38.58** | **+7.59** |
-| TurboQuant learned rotation | 102.08 | +71.08 |
-| Polar + QJL | 60.32 | +29.33 |
+| fp16 baseline | 22.80 | — |
+| TurboQuant base  key=4b val=2b | 43.90 | +21.11 |
+| **TurboQuant m=2d sketch  key=4b val=2b** | **32.62** | **+9.83** |
+| TurboQuant base  key=3b val=2b | 134.71 | +111.92 |
+| TurboQuant base  key=2b val=2b | 381.89 | +359.09 |
 
-### Larger QJL sketch (m = 2d)
+## Experiment: larger QJL sketch (m = 2d)
 
-The original TurboQuant paper fixes the QJL sketch matrix at S ∈ ℝ^(d×d), i.e. m = d, and does not vary this. The QJL paper discusses theoretically that error scales as 1/√m but only uses m = d in experiments. Neither paper nor PolarQuant explores m > d in practice.
+The original TurboQuant paper fixes the QJL sketch matrix at S ∈ ℝ^(d×d) (m = d) and does not vary this. The QJL paper shows theoretically that error scales as 1/√m but only uses m = d in experiments. Neither paper nor PolarQuant explores m > d in practice.
 
-Using m = 2d (doubling the sketch size) reduces the perplexity gap from +13.78 to +7.59 — nearly halving the quality loss at the same bit-width. The tradeoff is slightly more memory for the sketch and a larger matrix multiply at inference. This appears to be a novel practical finding not present in any of the three source papers.
-
-### Learned rotation (PCA)
-
-Instead of the random Haar rotation, this calibrates a per-head rotation from actual GPT-2 key vectors using SVD (principal components). Result: perplexity gets much worse (+71.08 vs +13.78). The random rotation is not a heuristic — it is theoretically correct. The Lloyd-Max codebook is derived for the arc-sine coordinate distribution that only holds after a Haar-distributed rotation of a unit vector. A data-driven rotation breaks this assumption and the codebook no longer matches the actual distribution.
-
-### Polar + QJL
-
-Replaces the MSE stage with a polar coordinate transform (following PolarQuant): vectors are recursively decomposed into angles across log₂(d) levels, with level 0 quantized at 4 bits and levels 1+ at 2 bits. QJL correction is then applied to the residual. Result: worse than base TurboQuant (+29.33 vs +13.78). The polar quantization at these bit widths introduces more MSE than the 3-bit Lloyd-Max scalar quantizer, and the QJL correction cannot compensate. Negative result, but confirms that TurboQuant's MSE stage is well-optimised for this regime.
+Doubling the sketch size to m = 2d cuts the perplexity gap at 4-bit keys from +21.11 to +9.83 — less than half the quality loss. The tradeoff is a 2× larger S matrix and slightly more compute at inference. This does not appear in any of the three source papers.
