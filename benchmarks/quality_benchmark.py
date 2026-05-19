@@ -36,42 +36,38 @@ def make_tq_attention(orig_attn, key_bits: int, val_bits: int, layer_idx: int):
         for h in range(n_heads)
     ]
 
-    orig_forward = orig_attn.forward
-
     def tq_forward(hidden_states, **kwargs):
-        # Clear cache at the start of each forward pass (prefill resets it).
         for c in caches:
             c.clear()
 
-        # Compute full Q, K, V via the original projection.
         bsz, seq_len, _ = hidden_states.shape
-        query, key, value = orig_attn.c_attn(hidden_states).split(
-            orig_attn.embed_dim, dim=2
+        # Split projection: (b, s, 3*embed) → three (b, s, embed) tensors
+        q_proj, k_proj, v_proj = orig_attn.c_attn(hidden_states).split(
+            orig_attn.split_size, dim=2
         )
-        query = orig_attn._split_heads(query, n_heads, head_dim)  # (b, h, s, d)
-        key   = orig_attn._split_heads(key,   n_heads, head_dim)
-        value = orig_attn._split_heads(value, n_heads, head_dim)
+        # Reshape to (b, n_heads, s, head_dim)
+        shape = (bsz, seq_len, n_heads, head_dim)
+        query = q_proj.view(shape).transpose(1, 2)
+        key   = k_proj.view(shape).transpose(1, 2)
+        value = v_proj.view(shape).transpose(1, 2)
 
         attn_output_heads = []
         for h in range(n_heads):
-            # Compress each token's key and value into the cache.
             for t in range(seq_len):
                 caches[h].append(key[0, h, t], value[0, h, t])
 
-            # Compute attention scores for each query token.
             head_outputs = []
             for t in range(seq_len):
-                q_t = query[0, h, t]                     # (d,)
-                raw = caches[h].attn_scores(q_t)[:t+1]   # (t+1,)
+                q_t = query[0, h, t]
+                raw = caches[h].attn_scores(q_t)[:t+1]
                 w = torch.softmax(raw / math.sqrt(head_dim), dim=0)
-                vals = caches[h].values()[:t+1]           # (t+1, d)
+                vals = caches[h].values()[:t+1]
                 head_outputs.append((w.unsqueeze(1) * vals).sum(0))
 
-            attn_output_heads.append(torch.stack(head_outputs))  # (s, d)
+            attn_output_heads.append(torch.stack(head_outputs))  # (s, head_dim)
 
-        # (b=1, h, s, d) → (b, s, h*d)
-        out = torch.stack(attn_output_heads, dim=0).unsqueeze(0)
-        out = orig_attn._merge_heads(out, n_heads, head_dim)
+        # (n_heads, s, head_dim) → (b, s, embed_dim)
+        out = torch.stack(attn_output_heads, dim=0).transpose(0, 1).reshape(bsz, seq_len, n_heads * head_dim)
         out = orig_attn.c_proj(out)
         out = orig_attn.resid_dropout(out)
         return out, None
