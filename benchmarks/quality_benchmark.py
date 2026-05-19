@@ -113,12 +113,17 @@ def make_tq_attention(orig_attn, key_bits, val_bits, layer_idx):
 
 
 @torch.no_grad()
-def perplexity(model, tokenizer, text, n_tokens=N_TOKENS):
+def perplexity(model, tokenizer, text, n_tokens=N_TOKENS, label=""):
+    import time
     encodings = tokenizer(text, return_tensors="pt")
     input_ids = encodings.input_ids.to(DEVICE)
 
+    chunks = list(range(0, min(n_tokens, input_ids.size(1) - 1), STRIDE))
+    n_chunks = len(chunks)
     nlls = []
-    for i in range(0, min(n_tokens, input_ids.size(1) - 1), STRIDE):
+    t0 = time.perf_counter()
+
+    for idx, i in enumerate(chunks):
         begin = max(0, i - MAX_LEN + STRIDE)
         end = min(i + STRIDE, input_ids.size(1))
         chunk = input_ids[:, begin:end]
@@ -133,11 +138,20 @@ def perplexity(model, tokenizer, text, n_tokens=N_TOKENS):
         )
         nlls.append(loss.item() * target_len)
 
+        elapsed = time.perf_counter() - t0
+        avg = elapsed / (idx + 1)
+        eta = avg * (n_chunks - idx - 1)
+        prefix = f"  [{label}] " if label else "  "
+        print(f"{prefix}chunk {idx+1}/{n_chunks}  ppl so far {math.exp(sum(nlls)/((idx+1)*STRIDE)):.2f}"
+              f"  elapsed {elapsed:.0f}s  eta {eta:.0f}s", end="\r", flush=True)
+
+    print()
     return math.exp(sum(nlls) / n_tokens)
 
 
 def run(quick=False):
-    n_tokens = STRIDE if quick else N_TOKENS        # one chunk in quick mode
+    import time
+    n_tokens = STRIDE if quick else N_TOKENS
     configs = [(4, 2)] if quick else [(4, 2), (3, 2), (2, 2)]
 
     print(f"Loading {MODEL_NAME} and WikiText-2 …")
@@ -147,17 +161,22 @@ def run(quick=False):
 
     model = AutoModelForCausalLM.from_pretrained(MODEL_NAME).to(DEVICE)
     model.eval()
-    ppl_baseline = perplexity(model, tokenizer, text, n_tokens)
-    print(f"fp16 baseline perplexity: {ppl_baseline:.2f}")
+    print("running baseline …")
+    t0 = time.perf_counter()
+    ppl_baseline = perplexity(model, tokenizer, text, n_tokens, label="baseline")
+    print(f"fp16 baseline  ppl={ppl_baseline:.2f}  ({time.perf_counter()-t0:.0f}s)")
 
     for key_bits, val_bits in configs:
         model_tq = AutoModelForCausalLM.from_pretrained(MODEL_NAME).to(DEVICE)
         model_tq.eval()
         for i, block in enumerate(model_tq.transformer.h):
             make_tq_attention(block.attn, key_bits=key_bits, val_bits=val_bits, layer_idx=i)
-        ppl = perplexity(model_tq, tokenizer, text, n_tokens)
+        label = f"key={key_bits}b val={val_bits}b"
+        print(f"running TurboQuant {label} …")
+        t0 = time.perf_counter()
+        ppl = perplexity(model_tq, tokenizer, text, n_tokens, label=label)
         delta = ppl - ppl_baseline
-        print(f"TurboQuant key={key_bits}b val={val_bits}b  ppl={ppl:.2f}  Δ={delta:+.2f}")
+        print(f"TurboQuant {label}  ppl={ppl:.2f}  Δ={delta:+.2f}  ({time.perf_counter()-t0:.0f}s)")
         del model_tq
 
 
