@@ -58,7 +58,10 @@ def lloyd_max(d: int, n_levels: int, tol: float = 1e-6, max_iter: int = 1000) ->
 
 
 def mse_cost(centroids: np.ndarray, d: int) -> float:
-    """Expected MSE of a codebook against the coordinate distribution (Eq. 4)."""
+    """Per-coordinate MSE of a codebook against the coordinate distribution (Eq. 4).
+
+    The full vector MSE is d × mse_cost (paper Theorem 1 reports vector-level values).
+    """
     boundaries = np.concatenate([[-1.0], (centroids[:-1] + centroids[1:]) / 2, [1.0]])
     cost = 0.0
     for i, c in enumerate(centroids):
@@ -68,3 +71,8 @@ def mse_cost(centroids: np.ndarray, d: int) -> float:
         )
         cost += val
     return cost
+
+
+def vector_mse_cost(centroids: np.ndarray, d: int) -> float:
+    """Full vector MSE = d × per-coordinate MSE. Matches Theorem 1 values."""
+    return d * mse_cost(centroids, d)
