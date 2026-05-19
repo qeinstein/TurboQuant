@@ -38,10 +38,7 @@ def make_tq_attention(orig_attn, key_bits: int, val_bits: int, layer_idx: int):
 
     orig_forward = orig_attn.forward
 
-    def tq_forward(hidden_states, layer_past=None, attention_mask=None,
-                   head_mask=None, encoder_hidden_states=None,
-                   encoder_attention_mask=None, use_cache=False,
-                   output_attentions=False):
+    def tq_forward(hidden_states, **kwargs):
         # Clear cache at the start of each forward pass (prefill resets it).
         for c in caches:
             c.clear()
