@@ -1,5 +1,6 @@
 import numpy as np
-from scipy import integrate, optimize
+from scipy import integrate
+from scipy.optimize import brentq
 
 
 def _coord_pdf(x: np.ndarray, d: int) -> np.ndarray:
@@ -29,10 +30,16 @@ def lloyd_max(d: int, n_levels: int, tol: float = 1e-6, max_iter: int = 1000) ->
     Returns:
         centroids: (n_levels,) sorted array of optimal centroids in [-1, 1].
     """
-    # Initialise centroids at distribution quantiles so convergence is fast.
-    # For this symmetric distribution, space them symmetrically in (-1, 1).
-    eps = 1e-6
-    centroids = np.linspace(-1 + eps, 1 - eps, n_levels)
+    # Initialise at CDF quantiles so every level starts with equal probability mass.
+    # linspace(-1, 1) wastes levels in sparse tails for concentrated distributions.
+    def cdf(x):
+        val, _ = integrate.quad(lambda t: _coord_pdf(t, d), -1.0, x, limit=200)
+        return val
+
+    quantile_probs = np.linspace(1 / (2 * n_levels), 1 - 1 / (2 * n_levels), n_levels)
+    centroids = np.array([
+        brentq(lambda x: cdf(x) - p, -1 + 1e-10, 1 - 1e-10) for p in quantile_probs
+    ])
 
     for _ in range(max_iter):
         # Voronoi boundaries: midpoints between consecutive centroids.

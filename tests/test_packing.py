@@ -3,7 +3,7 @@ import pytest
 from turboquant.core.packing import pack, unpack
 
 
-@pytest.mark.parametrize("bits", [1, 2, 4, 8])
+@pytest.mark.parametrize("bits", [1, 2, 3, 4, 8])
 @pytest.mark.parametrize("length", [64, 128, 130])
 def test_roundtrip(bits, length):
     indices = torch.randint(0, 2**bits, (length,), dtype=torch.int64)
@@ -23,4 +23,4 @@ def test_packed_size(bits, length, expected_bytes):
 
 def test_unsupported_bits_raises():
     with pytest.raises(ValueError):
-        pack(torch.zeros(8, dtype=torch.int64), bits=3)
+        pack(torch.zeros(8, dtype=torch.int64), bits=9)
